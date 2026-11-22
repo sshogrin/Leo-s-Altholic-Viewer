@@ -13,6 +13,8 @@ from tkinter import filedialog, messagebox
 from tkinter import font as tkfont
 from ctypes import wintypes
 
+CONFIG_FILENAME = "LeoAltholicViewer_config.json"
+
 def resource_path(relative_path: str) -> str:
     """Get absolute path to resource, works for dev and for PyInstaller --onefile."""
     base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -50,58 +52,85 @@ def find_eso_saved_vars(filename: str = "LeoAltholic.lua") -> Path | None:
             
     return None
 
+CONFIG_FILENAME = "LeoAltholicViewer_config.json"
+
 def get_saved_vars_path() -> Path | None:
     return find_eso_saved_vars("LeoAltholic.lua")
 
-def get_config_path() -> Path:
-    """Returns the path to config.json in the same folder as the .exe (or script)."""
+def get_config_path(vars_path: Path | None = None) -> Path:
+    """
+    Returns the path to LeoAltholicViewer_config.json inside the SavedVariables folder
+    so Minion add-on updates never erase user settings.
+    """
+    # 1. If a specific LeoAltholic.lua path was provided, save right next to it
+    if vars_path and vars_path.parent.is_dir():
+        return vars_path.parent / CONFIG_FILENAME
+
+    # 2. Otherwise, check if we can auto-detect the ESO SavedVariables folder
+    detected_lua = get_saved_vars_path()
+    if detected_lua and detected_lua.parent.is_dir():
+        return detected_lua.parent / CONFIG_FILENAME
+
+    # 3. Standard default ESO SavedVariables path fallback (even if LeoAltholic.lua isn't created yet)
+    default_sv_dir = Path.home() / "Documents" / "Elder Scrolls Online" / "live" / "SavedVariables"
+    if default_sv_dir.is_dir():
+        return default_sv_dir / CONFIG_FILENAME
+
+    # 4. Final fallback: folder where the .exe (or script) lives (e.g., on a PC without ESO installed)
     if getattr(sys, "frozen", False):
         app_dir = Path(sys.executable).resolve().parent
     else:
         app_dir = Path(__file__).resolve().parent
-    return app_dir / "config.json"
+    return app_dir / CONFIG_FILENAME
 
-def load_saved_config_path() -> Path | None:
-    """Reads the saved LeoAltholic.lua path from config.json if it exists."""
+def _read_config() -> dict:
+    """Safely reads the full dictionary from LeoAltholicViewer_config.json."""
     config_file = get_config_path()
     if config_file.is_file():
         try:
             data = json.loads(config_file.read_text(encoding="utf-8"))
-            saved = data.get("saved_vars_path")
-            if saved:
-                return Path(saved)
-        except Exception:
-            pass
-    return None
-
-def _read_config() -> dict:
-    """Safely reads the full dictionary from config.json."""
-    config_file = get_config_path()
-    if config_file.is_file():
-        try:
-            return json.loads(config_file.read_text(encoding="utf-8"))
+            # If the saved path points to a custom/network SavedVariables folder,
+            # check if a config file also exists in that custom folder and prefer it.
+            saved_str = data.get("saved_vars_path")
+            if saved_str:
+                custom_config = get_config_path(Path(saved_str))
+                if custom_config != config_file and custom_config.is_file():
+                    return json.loads(custom_config.read_text(encoding="utf-8"))
+            return data
         except Exception:
             pass
     return {}
 
 def _write_config(data: dict) -> None:
-    """Safely writes the full dictionary to config.json."""
-    config_file = get_config_path()
+    """Safely writes the full dictionary to LeoAltholicViewer_config.json."""
+    saved_str = data.get("saved_vars_path")
+    target_file = get_config_path(Path(saved_str)) if saved_str else get_config_path()
+    
     try:
-        config_file.write_text(
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        target_file.write_text(
             json.dumps(data, indent=2),
             encoding="utf-8"
         )
+        
+        # If saving to a custom/network folder, also mirror to the default SavedVariables
+        # location so the app immediately knows where to find the custom path on next launch.
+        default_file = get_config_path()
+        if target_file != default_file and default_file.parent.is_dir():
+            default_file.write_text(
+                json.dumps(data, indent=2),
+                encoding="utf-8"
+            )
     except Exception:
         pass
 
 def load_saved_config_path() -> Path | None:
-    """Reads the saved LeoAltholic.lua path from config.json if it exists."""
+    """Reads the saved LeoAltholic.lua path from LeoAltholicViewer_config.json if it exists."""
     saved = _read_config().get("saved_vars_path")
     return Path(saved) if saved else None
 
 def save_config_path(vars_path: Path) -> None:
-    """Writes the valid LeoAltholic.lua path to config.json without erasing other settings."""
+    """Writes the valid LeoAltholic.lua path to LeoAltholicViewer_config.json without erasing other settings."""
     data = _read_config()
     data["saved_vars_path"] = str(vars_path)
     _write_config(data)
