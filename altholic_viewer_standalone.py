@@ -6,12 +6,13 @@ import tkinter as tk
 import sys
 import os
 import winreg
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from tkinter import messagebox, ttk
 from tkinter import filedialog, messagebox
 from tkinter import font as tkfont
 from ctypes import wintypes
+from builds_tab import BuildsTab
 
 CONFIG_FILENAME = "LeoAltholicViewer_config.json"
 
@@ -51,8 +52,6 @@ def find_eso_saved_vars(filename: str = "LeoAltholic.lua") -> Path | None:
             return candidate
             
     return None
-
-CONFIG_FILENAME = "LeoAltholicViewer_config.json"
 
 def get_saved_vars_path() -> Path | None:
     return find_eso_saved_vars("LeoAltholic.lua")
@@ -175,6 +174,45 @@ def save_window_geometry(win_obj, key: str = "window") -> None:
             _write_config(data)
     except Exception:
         pass
+
+def load_view_state() -> dict:
+    """Restores the last active tab and scroll positions from config.json."""
+    return _read_config().get("view_state", {})
+
+def save_view_state(state: dict) -> None:
+    """Saves the active tab and scroll positions to config.json."""
+    try:
+        data = _read_config()
+        data["view_state"] = state
+        _write_config(data)
+    except Exception:
+        pass
+
+def load_view_prefs() -> dict:
+    """Loads saved server, account, and character sort preferences."""
+    data = _read_config()
+    server = data.get("selected_server", "ALL")
+    sort_mode = data.get("character_sort", "Creation Order NA-EU" if server == "ALL" else "Creation Order")
+
+    # Normalize sort_mode so it always matches the loaded server filter
+    if server == "ALL" and sort_mode == "Creation Order":
+        sort_mode = "Creation Order NA-EU"
+    elif server != "ALL" and sort_mode in ("Creation Order NA-EU", "Creation Order EU-NA"):
+        sort_mode = "Creation Order"
+
+    return {
+        "server": server,
+        "account": data.get("selected_account", "ALL"),
+        "sort": sort_mode,
+    }
+
+def save_view_prefs(server: str, account: str, sort_mode: str) -> None:
+    """Persists the active server, account, and character sort selection."""
+    data = _read_config()
+    data["selected_server"] = server
+    data["selected_account"] = account
+    data["character_sort"] = sort_mode
+    _write_config(data)
 
 def get_app_version(default="1.0.0"):
     # 1. When running as a compiled .exe, read the embedded Windows FileVersion
@@ -595,12 +633,17 @@ class AltholicApp:
         self.banks = []
         self.raw_data = {}
         self.trees = {}
+        self.top_character = ""
+        self.text_tabs = []
+        self.top_character = ""
+        self._restoring_view = False
 
         self.setup_styles()
         self.build_ui()
         self.saved_vars_path = load_saved_config_path()
         self.load_data()
-
+        self.restore_view_state(load_view_state())
+        
         self.current_file_path = None
         self.last_mtime = 0
         self.auto_refresh_enabled = True  # Optional toggle state
@@ -611,8 +654,111 @@ class AltholicApp:
         if getattr(self, "inv_win", None) is not None and self.inv_win.winfo_exists():
             save_window_geometry(self.inv_win, key="inventory_window")
         save_window_geometry(self.root, key="window")
+        save_view_state(self.capture_view_state())
         self.root.destroy()
+        
+    def _detect_top_character(self, txt) -> str:
+        """Reads the character name at the top-left of the visible Text viewport."""
+        try:
+            top_index = txt.index("@0,18")
+            line_str, _, _ = top_index.partition(".")
+            top_line = int(line_str)
 
+            # Walk upward up to 15 lines in case we scrolled mid-way through a multi-line character block
+            for ln in range(top_line, max(0, top_line - 15), -1):
+                line_text = txt.get(f"{ln}.0", f"{ln}.end")
+                if not line_text or line_text.startswith("\t") or line_text.startswith(" "):
+                    continue
+                first_col, _, _ = line_text.partition("\t")
+                name = first_col.strip()
+                # Skip separator lines or bank header lines
+                if name and not set(name) <= {"-", "=", "_"} and "Bank" not in name:
+                    return name
+        except Exception:
+            pass
+        return ""
+
+    def _jump_to_character(self, txt, char_name: str) -> None:
+        """Scrolls txt so that char_name's row is flush at the top of the viewport."""
+        try:
+            if not char_name:
+                txt.yview_moveto(0.0)
+                return
+            # Search specifically for the character name at the start of a column followed by a tab
+            pos = txt.search(f"{char_name}\t", "1.0", stopindex="end")
+            if pos:
+                line_str, _, _ = pos.partition(".")
+                line_num = int(line_str)
+                # yview(line_num - 1) places that exact line at the top edge
+                txt.yview(max(0, line_num - 1))
+        except Exception:
+            pass
+
+    def on_tab_changed(self, event=None):
+        """Synchronizes the newly opened tab to self.top_character."""
+        selected_id = self.notebook.select()
+        if not selected_id:
+            return
+        tab_frame = self.notebook.nametowidget(selected_id)
+
+        # Find which registered txt widget belongs to this tab
+        target_txt = next((t for t in self.text_tabs if str(t).startswith(str(tab_frame))), None)
+        if not target_txt:
+            return
+
+        self._restoring_view = True
+        def sync_now():
+            try:
+                self._jump_to_character(target_txt, self.top_character)
+            finally:
+                self._restoring_view = False
+
+        self.root.after_idle(sync_now)
+
+    def capture_view_state(self) -> dict:
+        """Returns the active tab name and the top visible character."""
+        last_tab = ""
+        if hasattr(self, "notebook"):
+            selected_id = self.notebook.select()
+            if selected_id:
+                last_tab = self.notebook.tab(selected_id, "text")
+
+        return {
+            "last_tab": last_tab,
+            "top_character": self.top_character,
+        }
+
+    def restore_view_state(self, view_state: dict) -> None:
+        """Restores the last active tab and scrolls all tabs to top_character."""
+        if not isinstance(view_state, dict):
+            return
+
+        self._restoring_view = True
+        saved_char = view_state.get("top_character", "")
+        if isinstance(saved_char, str):
+            self.top_character = saved_char
+
+        last_tab = view_state.get("last_tab")
+        if last_tab and hasattr(self, "notebook"):
+            for tab_id in self.notebook.tabs():
+                if self.notebook.tab(tab_id, "text") == last_tab:
+                    self.notebook.select(tab_id)
+                    break
+
+        def apply_all():
+            try:
+                for txt in self.text_tabs:
+                    self._jump_to_character(txt, self.top_character)
+            finally:
+                self._restoring_view = False
+
+        self.root.after(50, apply_all)
+
+    def refresh_data(self):
+        """Reloads SavedVariables while preserving the active tab and scroll positions."""
+        view_state = self.capture_view_state()
+        self.load_data()
+        self.restore_view_state(view_state)
 
     def setup_styles(self):
         style = ttk.Style()
@@ -706,13 +852,25 @@ class AltholicApp:
         vsb = ttk.Scrollbar(body_frame, orient="vertical")
         hsb = ttk.Scrollbar(body_frame, orient="horizontal")
 
+        def on_yscroll(first, last):
+            vsb.set(first, last)
+            if not getattr(self, "_restoring_view", False) and txt.winfo_ismapped():
+                # Ignore (0.0, 1.0) which fires when a table is cleared during refresh
+                if not (float(first) == 0.0 and float(last) == 1.0):
+                    if float(first) <= 0.001:
+                        self.top_character = ""
+                    else:
+                        found = self._detect_top_character(txt)
+                        if found:
+                            self.top_character = found
+
         txt = tk.Text(
             body_frame, bg="#1e1e24", fg="#e2dcd0", font=("Segoe UI", font_size),
             padx=10, pady=4, bd=0, highlightthickness=0,
             spacing1=line_spacing // 2, spacing3=line_spacing // 2,
             tabs=tabs_tuple, tabstyle="tabular",
             state="disabled", wrap="none",
-            yscrollcommand=vsb.set
+            yscrollcommand=on_yscroll
         )
 
         # Sync horizontal scrolling across both the frozen header and the body
@@ -740,7 +898,11 @@ class AltholicApp:
         txt.pack(side="left", fill="both", expand=True)
         txt.hdr_txt = hdr_txt
         txt.pixel_widths = list(pixel_widths)
+        if not hasattr(self, "text_tabs"):
+            self.text_tabs = []
+        self.text_tabs.append(txt)
         return txt
+
 
     def build_bio_text(self, parent, cols):
         self.bio_cols = cols
@@ -865,7 +1027,6 @@ class AltholicApp:
                 self.stats_text.insert("end", text, tags)
 
         self.stats_text.config(state="disabled")
-
 
     def build_champion_text(self, parent, cols):
         self.champion_cols = cols
@@ -1395,6 +1556,154 @@ class AltholicApp:
         render_all()
         search_entry.focus_set()
  
+    def sync_sort_options(self):
+        selected_server = self.server_var.get()
+        current_sort = self.sort_var.get()
+
+        if selected_server == "ALL":
+            options = ["Creation Order NA-EU", "Creation Order EU-NA", "Name (A-Z)", "Name (Z-A)"]
+            if current_sort == "Creation Order":
+                self.sort_var.set("Creation Order NA-EU")
+        else:
+            options = ["Creation Order", "Name (A-Z)", "Name (Z-A)"]
+            if current_sort in ("Creation Order NA-EU", "Creation Order EU-NA"):
+                self.sort_var.set("Creation Order")
+
+        self.sort_combo["values"] = options
+
+    def on_filter_changed(self, event=None):
+        self.sync_sort_options()
+        save_view_prefs(
+            self.server_var.get(),
+            self.account_var.get(),
+            self.sort_var.get(),
+        )
+        self.refresh_tables()
+        if hasattr(self, "writ_timer_label"):
+            self.update_writ_timer()
+            
+    def _get_active_writ_server(self):
+        """Detects whether the currently viewed server/account is NA or EU."""
+        if hasattr(self, "server_combo"):
+            val = self.server_combo.get().upper()
+            if "EU" in val:
+                return "EU"
+            if "NA" in val:
+                return "NA"
+
+        if hasattr(self, "account_combo"):
+            val = self.account_combo.get().upper()
+            if "EU" in val:
+                return "EU"
+            if "NA" in val:
+                return "NA"
+
+        return "ALL"
+
+    def build_writs_text(self, parent, cols):
+        self.writs_cols = cols
+        self.writs_text = self.create_uniform_text_tab(parent, cols, [180, 105, 115, 105, 105, 105, 110, 115])
+        self.writs_text.tag_configure("writ_done", foreground="#4dff88", font=("Segoe UI", 9, "bold"))    # Green: Done today
+        self.writs_text.tag_configure("writ_active", foreground="#ffd700", font=("Segoe UI", 9, "bold"))  # Gold: In journal
+        self.writs_text.tag_configure("writ_open", foreground="#ff4d4d", font=("Segoe UI", 9))           # Red: Not done today
+        self.writs_text.tag_configure("writ_none", foreground="#777777", font=("Segoe UI", 9))           # Gray: Not certified
+
+        # Upper-right corner inside the frozen header bar
+        hdr_frame = self.writs_text.hdr_txt.master
+        self.writ_timer_label = tk.Label(
+            hdr_frame,
+            text="Reset: --:--:--",
+            bg="#24242b",
+            fg="#d4af37",
+            font=("Segoe UI", 10, "bold"),
+            padx=12
+        )
+        self.writ_timer_label.pack(side="right")
+
+        self._last_writ_reset_ts = None
+        self.update_writ_timer()
+
+    def populate_writs_text(self, writs_rows):
+        self._last_writs_rows = writs_rows
+        self.writs_text.config(state="normal")
+        self.writs_text.delete("1.0", "end")
+
+        craft_keys = ["Alchemy", "Blacksmithing", "Clothing", "Enchanting", "Jewelry", "Provisioning", "Woodworking"]
+        tag_map = {
+            "Done": "writ_done",
+            "Active": "writ_active",
+            "Open": "writ_open",
+        }
+
+        for row_idx, row in enumerate(writs_rows):
+            row_tag = "even" if row_idx % 2 == 0 else "odd"
+            alliance_tag = self.get_alliance_tag_from_row(row)
+            name_tags = (row_tag, alliance_tag) if alliance_tag else (row_tag,)
+
+            self.writs_text.insert("end", f"{row['name']}\t", name_tags)
+            for i, craft in enumerate(craft_keys):
+                val = row.get(craft) or row.get("Jewelry Crafting" if craft == "Jewelry" else craft, "—")
+                w_tag = tag_map.get(val, "writ_none")
+                sep = "\n" if i == len(craft_keys) - 1 else "\t"
+                self.writs_text.insert("end", f"{val}{sep}", (row_tag, w_tag))
+
+        self.writs_text.config(state="disabled")
+
+    def _calc_reset_info(self, reset_hour, now_utc):
+        """Returns (next_reset_datetime, 'HH:MM:SS') for a given UTC reset hour."""
+        reset_today = now_utc.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+        next_reset = reset_today + timedelta(days=1) if now_utc >= reset_today else reset_today
+        remaining = next_reset - now_utc
+        total_seconds = max(0, int(remaining.total_seconds()))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return next_reset, f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def update_writ_timer(self):
+        if getattr(self, "_writ_timer_job", None):
+            self.writ_timer_label.after_cancel(self._writ_timer_job)
+
+        mode = self._get_active_writ_server()
+        now_utc = datetime.now(timezone.utc)
+
+        na_next, na_str = self._calc_reset_info(10, now_utc)  # NA resets at 10:00 UTC
+        eu_next, eu_str = self._calc_reset_info(3, now_utc)   # EU resets at 03:00 UTC
+
+        # Track NA and EU rollovers independently so 'All' flips only the server that reset
+        prev_targets = getattr(self, "_last_writ_reset_targets", {})
+        if "NA" in prev_targets and na_next > prev_targets["NA"]:
+            self._flip_done_writs_to_open(target_server="NA")
+        if "EU" in prev_targets and eu_next > prev_targets["EU"]:
+            self._flip_done_writs_to_open(target_server="EU")
+        self._last_writ_reset_targets = {"NA": na_next, "EU": eu_next}
+
+        if mode == "ALL":
+            self.writ_timer_label.config(text=f"Reset: NA {na_str} | EU {eu_str}")
+        elif mode == "EU":
+            self.writ_timer_label.config(text=f"Reset: {eu_str}")
+        else:
+            self.writ_timer_label.config(text=f"Reset: {na_str}")
+
+        self._writ_timer_job = self.writ_timer_label.after(1000, self.update_writ_timer)
+
+    def _flip_done_writs_to_open(self, target_server=None):
+        rows = getattr(self, "_last_writs_rows", None)
+        if not rows:
+            return
+        craft_keys = ["Alchemy", "Blacksmithing", "Clothing", "Enchanting", "Jewelry", "Jewelry Crafting", "Provisioning", "Woodworking"]
+        changed = False
+        for row in rows:
+            if target_server:
+                row_srv = str(row.get("server", "")).upper()
+                if row_srv and target_server not in row_srv:
+                    continue
+            for key in craft_keys:
+                if row.get(key) == "Done":
+                    row[key] = "Open"
+                    changed = True
+        if changed:
+            self.populate_writs_text(rows)
+       
     def build_ui(self):
         # Top Header Bar
         header = ttk.Frame(self.root, style="Header.TFrame", padding=(16, 10))
@@ -1409,36 +1718,36 @@ class AltholicApp:
         self.server_var = tk.StringVar(value="ALL")
         self.server_combo = ttk.Combobox(controls, textvariable=self.server_var, state="readonly", width=18)
         self.server_combo.pack(side="left", padx=(0, 12))
-        self.server_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_tables())
+        self.server_combo.bind("<<ComboboxSelected>>", self.on_filter_changed)
 
         ttk.Label(controls, text="Account:", style="Sub.TLabel").pack(side="left", padx=(0, 4))
         self.account_var = tk.StringVar(value="ALL")
         self.account_combo = ttk.Combobox(controls, textvariable=self.account_var, state="readonly", width=18)
         self.account_combo.pack(side="left", padx=(0, 12))
-        self.account_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_tables())
+        self.account_combo.bind("<<ComboboxSelected>>", self.on_filter_changed)
 
         ttk.Label(controls, text="Sort:", style="Sub.TLabel").pack(side="left", padx=(0, 4))
-        self.sort_var = tk.StringVar(value="Creation Order")
+        self.sort_var = tk.StringVar(value="Creation Order NA-EU")
         self.sort_combo = ttk.Combobox(
             controls,
             textvariable=self.sort_var,
-            values=["Creation Order", "Name (A-Z)", "Name (Z-A)"],
+            values=["Creation Order NA-EU", "Creation Order EU-NA", "Name (A-Z)", "Name (Z-A)"],
             state="readonly",
-            width=16
+            width=21
         )
         self.sort_combo.pack(side="left", padx=(0, 12))
-        self.sort_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_tables())
+        self.sort_combo.bind("<<ComboboxSelected>>", self.on_filter_changed)
 
         refresh_btn = tk.Button(
-            controls, text="Refresh", command=self.load_data,
+            controls, text="Refresh", command=self.refresh_data,
             bg="#2d2922", fg="#d4af37", activebackground="#3d372e", activeforeground="#fff",
             relief="solid", bd=1, padx=10, pady=2, font=("Segoe UI", 9, "bold"), cursor="hand2"
         )
+
         refresh_btn.pack(side="left", padx=(0, 12))
 
         self.status_label = ttk.Label(controls, text="", style="Sub.TLabel")
         self.status_label.pack(side="left")
-
 
         # Main Notebook Tabs
         self.notebook = ttk.Notebook(self.root)
@@ -1450,9 +1759,11 @@ class AltholicApp:
             ("champion", "Champion", ["Character", "Total CP", "Warfare (Blue)", "Fitness (Red)", "Craft (Green)"], 32),
             ("combat", "Combat Skills", ["Character", "Class", "Weapon", "Armor", "Guild", "World / Racial", "Alliance"], 115),
             ("craft", "Crafting Skills", ["Character", "Alchemy", "Blacksmithing", "Clothing", "Enchanting", "Jewelry", "Provisioning", "Woodworking"], 32),
-            ("currency", "Currency", ["Character", "Gold", "Alliance Points", "Tel Var", "Writ Vouchers"], 32),
+            ("currency", "Currency", ["Character", "Gold", "Alliance Points", "Tel Var", "Writ Vouchers"], 32),            
             ("research", "Research", ["Character", "Blacksmithing", "Clothing", "Woodworking", "Jewelry"], 65),
             ("inventory", "Inventory", ["Character", "Bag Space", "Stored Items"], 32),
+            ("writs", "Writs", ["Character", "Alchemy", "Blacksmithing", "Clothing", "Enchanting", "Jewelry", "Provisioning", "Woodworking"], 32),
+
         ]
 
         for key, title, cols, row_h in tab_defs:
@@ -1476,7 +1787,10 @@ class AltholicApp:
                 continue
             if key == "currency":
                 self.build_currency_text(frame, cols)
-                continue             
+                continue
+            if key == "writs":
+                self.build_writs_text(frame, cols)
+                continue
             if key == "research":
                 self.build_research_text(frame, cols)
                 continue
@@ -1484,31 +1798,15 @@ class AltholicApp:
                 self.build_inventory_text(frame, cols)
                 continue
             
-            # ... keep your existing Treeview code for all other tabs ...
-
-            tree_style = f"{key}.Treeview"
-            s = ttk.Style()
-            s.configure(tree_style, background="#1e1e24", foreground="#e2dcd0", fieldbackground="#1e1e24", rowheight=row_h, font=("Segoe UI", 9))
-
-            tree = ttk.Treeview(frame, columns=cols, show="headings", style=tree_style)
-            vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-            hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-            tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
-            for col in cols:
-                tree.heading(col, text=col)
-                w = 180 if col == "Character" else (210 if key in ("combat", "research") else 135)
-                tree.column(col, width=w, anchor="w")
-
-            tree.tag_configure("bank", background="#282520", foreground="#d4af37", font=("Segoe UI", 10, "bold"))
-            tree.tag_configure("even", background="#1e1e24")
-            tree.tag_configure("odd", background="#23232a")
-            tree.tag_configure("maxed", foreground="#4dff88", font=("Segoe UI", 9, "bold"))
-            
-            vsb.pack(side="right", fill="y")
-            hsb.pack(side="bottom", fill="x")
-            tree.pack(fill="both", expand=True)
-            self.trees[key] = tree
+        # Builds Tab (Class Sub-Tabs + PNG Build Card Export)
+        self.builds_tab = BuildsTab(
+            self.notebook,
+            get_saved_vars_dir_fn=lambda: self.saved_vars_path.parent if self.saved_vars_path else None,
+            )
+        self.notebook.add(self.builds_tab, text="Builds")
+        
+        self._restoring_view = False
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
 
     def load_data(self):
         # 1. Reuse the path from memory or config.json if it still exists
@@ -1550,9 +1848,23 @@ class AltholicApp:
         self.server_combo["values"] = servers
         self.account_combo["values"] = accounts
 
+        # Restore saved server, account, and character sort selections
+        prefs = load_view_prefs()
+        self.server_var.set(prefs["server"] if prefs["server"] in servers else "ALL")
+        self.account_var.set(prefs["account"] if prefs["account"] in accounts else "ALL")
+
+        # Update sort_combo["values"] to match the restored server BEFORE setting sort_var
+        self.sync_sort_options()
+        if prefs["sort"] in self.sort_combo["values"]:
+            self.sort_var.set(prefs["sort"])
+
         updated = datetime.now().strftime("%H:%M:%S")
         self.status_label.config(text=f"Chars: {len(self.chars)} | Updated: {updated}")
+        if hasattr(self, "builds_tab"):
+             self.builds_tab.refresh_builds()
+
         self.refresh_tables()
+
 
     def check_file_updates(self):
         if getattr(self, "auto_refresh_enabled", True) and self.saved_vars_path:
@@ -1562,7 +1874,9 @@ class AltholicApp:
 
                     if current_mtime != getattr(self, "last_mtime", 0):
                         time.sleep(0.25)
+                        view_state = self.capture_view_state()
                         self.load_data()
+                        self.restore_view_state(view_state)
 
             except (OSError, PermissionError):
                 pass
@@ -1594,9 +1908,39 @@ class AltholicApp:
         craft_rows = []
         research_rows = []
         currency_rows = []
+        writs_rows = []
         inventory_rows = []
         visible_idx = 0
 
+        # Daily writ reset helper (EU: 03:00 UTC | NA: 10:00 UTC)
+        now_utc = datetime.now(timezone.utc)
+        def get_last_reset_ts(server_str):
+            is_eu = "eu" in str(server_str or "").lower() or (
+                self.saved_vars_path and "liveeu" in str(self.saved_vars_path).lower()
+            )
+            reset_hour = 3 if is_eu else 10
+            reset_dt = now_utc.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+            if now_utc < reset_dt:
+                reset_dt -= timedelta(days=1)
+            return int(reset_dt.timestamp())
+
+        WRIT_CRAFT_IDS = {
+            1: "Blacksmithing",
+            2: "Clothing",
+            3: "Enchanting",
+            4: "Alchemy",
+            5: "Provisioning",
+            6: "Woodworking",
+            7: "Jewelry Crafting",
+        }
+
+        SERVER_PRIORITY = {
+            "NA Megaserver": 0,
+            "EU Megaserver": 1,
+            "NA": 0,
+            "EU": 1,
+        }
+        
         sort_mode = self.sort_var.get() if hasattr(self, "sort_var") else "Creation Order"
 
         if sort_mode == "Name (A-Z)":
@@ -1610,10 +1954,16 @@ class AltholicApp:
                 key=lambda c: str(c.get("_name", "")).lower(),
                 reverse=True
             )
-        else:  # "Creation Order"
+        else:  # Handles "Creation Order", "Creation Order NA-EU", and "Creation Order EU-NA"
+            if sort_mode == "Creation Order EU-NA":
+                server_priority = {"EU Megaserver": 0, "EU": 0, "NA Megaserver": 1, "NA": 1}
+            else:
+                server_priority = {"NA Megaserver": 0, "NA": 0, "EU Megaserver": 1, "EU": 1}
+
             ordered_chars = sorted(
                 self.chars,
                 key=lambda c: (
+                    server_priority.get(str(c.get("_server") or c.get("server") or ""), 99),
                     (c.get("bio", {}) if isinstance(c.get("bio"), dict) else {}).get("charIndex") or 999,
                     str(c.get("_name", "")).lower()
                 )
@@ -1956,7 +2306,36 @@ class AltholicApp:
                 "bag_items": bag_items,
                 "worn_items": worn_items,
             })
-            
+            # 9. Writs
+            last_reset_ts = get_last_reset_ts(c.get("_server"))
+            w_status = {p: "—" for p in ("Alchemy", "Blacksmithing", "Clothing", "Enchanting", "Jewelry Crafting", "Provisioning", "Woodworking")}
+            quests = c.get("quests", {}) if isinstance(c.get("quests"), dict) else {}
+            writs_data = quests.get("writs", {}) if isinstance(quests.get("writs"), dict) else {}
+
+            for k, w_entry in writs_data.items():
+                if not isinstance(w_entry, dict):
+                    continue
+                # LeoAltholic keys writs by CraftingType ID (1-7) or craft name
+                craft_col = WRIT_CRAFT_IDS.get(k) if isinstance(k, int) else None
+                if not craft_col:
+                    w_name = str(w_entry.get("name", k))
+                    for col_name in w_status:
+                        if col_name.split()[0].lower() in w_name.lower():
+                            craft_col = col_name
+                            break
+
+                if craft_col:
+                    last_done = w_entry.get("lastDone", 0)
+                    is_active = w_entry.get("active", False) or w_entry.get("status") == "active"
+                    if isinstance(last_done, (int, float)) and last_done >= last_reset_ts:
+                        w_status[craft_col] = "Done"
+                    elif is_active:
+                        w_status[craft_col] = "Active"
+                    elif isinstance(last_done, (int, float)) and last_done > 0:
+                        w_status[craft_col] = "Open"
+
+            writs_rows.append({"name": name, **w_status})
+             
         self.populate_bio_text(bio_rows)   
         self.populate_stats_grid(stats_rows)
         self.populate_champion_text(champion_rows)
@@ -1965,6 +2344,7 @@ class AltholicApp:
         self.populate_currency_text(bank_rows, currency_rows)
         self.populate_research_text(research_rows)
         self.populate_inventory_text(inventory_rows)
+        self.populate_writs_text(writs_rows)
         
 def main():
     root = tk.Tk()
