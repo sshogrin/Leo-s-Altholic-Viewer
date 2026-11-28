@@ -215,36 +215,28 @@ def save_view_prefs(server: str, account: str, sort_mode: str) -> None:
     _write_config(data)
 
 def get_app_version(default="1.0.0"):
-    # 1. When running as a compiled .exe, read the embedded Windows FileVersion
-    if getattr(sys, "frozen", False):
-        try:
-            exe_path = sys.executable
-            version_dll = ctypes.windll.version
-            size = version_dll.GetFileVersionInfoSizeW(exe_path, None)
-            if size:
-                buf = ctypes.create_string_buffer(size)
-                if version_dll.GetFileVersionInfoW(exe_path, 0, size, buf):
-                    p_val = ctypes.c_void_p()
-                    val_len = wintypes.UINT()
-                    # Query the root VS_FIXEDFILEINFO structure
-                    if version_dll.VerQueryValueW(buf, "\\", ctypes.byref(p_val), ctypes.byref(val_len)):
-                        # VS_FIXEDFILEINFO: dwFileVersionMS is at offset 8, dwFileVersionLS is at offset 12
-                        ms = ctypes.c_uint32.from_address(p_val.value + 8).value
-                        ls = ctypes.c_uint32.from_address(p_val.value + 12).value
-                        major, minor = ms >> 16, ms & 0xFFFF
-                        patch, build = ls >> 16, ls & 0xFFFF
-                        return f"{major}.{minor}.{patch}" if build == 0 else f"{major}.{minor}.{patch}.{build}"
-        except Exception:
-            pass
+    # 1. When running as an uncompiled .py script (e.g., IDLE)
+    if not getattr(sys, "frozen", False):
+        return "Dev"
 
-    # 2. When running as a .py script (or fallback), parse FileVersion from version_info.txt
+    # 2. When running as a compiled .exe, read the embedded Windows FileVersion
     try:
-        vfile = Path(__file__).resolve().parent / "version_info.txt"
-        if vfile.exists():
-            text = vfile.read_text(encoding="utf-8", errors="ignore")
-            match = re.search(r"StringStruct\s*\(\s*['\"]FileVersion['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)", text)
-            if match:
-                return match.group(1).strip()
+        exe_path = sys.executable
+        version_dll = ctypes.windll.version
+        size = version_dll.GetFileVersionInfoSizeW(exe_path, None)
+        if size:
+            buf = ctypes.create_string_buffer(size)
+            if version_dll.GetFileVersionInfoW(exe_path, 0, size, buf):
+                p_val = ctypes.c_void_p()
+                val_len = wintypes.UINT()
+                # Query the root VS_FIXEDFILEINFO structure
+                if version_dll.VerQueryValueW(buf, "\\", ctypes.byref(p_val), ctypes.byref(val_len)):
+                    # VS_FIXEDFILEINFO: dwFileVersionMS is at offset 8, dwFileVersionLS is at offset 12
+                    ms = ctypes.c_uint32.from_address(p_val.value + 8).value
+                    ls = ctypes.c_uint32.from_address(p_val.value + 12).value
+                    major, minor = ms >> 16, ms & 0xFFFF
+                    patch, build = ls >> 16, ls & 0xFFFF
+                    return f"{major}.{minor}.{patch}" if build == 0 else f"{major}.{minor}.{patch}.{build}"
     except Exception:
         pass
 
@@ -601,6 +593,15 @@ ALLIANCE_COLORS = {
     "Ebonheart Pact": "#FF5555",
     "Daggerfall Covenant": "#5599FF",
 }
+WRIT_CRAFT_IDS = {
+    1: "Blacksmithing",
+    2: "Clothing",
+    3: "Enchanting",
+    4: "Alchemy",
+    5: "Provisioning",
+    6: "Woodworking",
+    7: "Jewelry Crafting",
+}
 
 class AltholicApp:
     def __init__(self, root):
@@ -613,9 +614,11 @@ class AltholicApp:
                 self.root.iconbitmap(default=ico_file)
         except Exception:
             pass
-        # Replace: self.root.geometry("1240x785")
-        load_window_geometry(self.root, default_width=1240, default_height=785)
-        self.root.minsize(1200, 620)
+        # Window Size
+        screen_h = self.root.winfo_screenheight()
+        initial_h = min(850, screen_h - 60)
+        load_window_geometry(self.root, default_width=1240, default_height=initial_h)
+        self.root.minsize(1200, 610) # For 720p monitors
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         
@@ -2315,8 +2318,9 @@ class AltholicApp:
             for k, w_entry in writs_data.items():
                 if not isinstance(w_entry, dict):
                     continue
-                # LeoAltholic keys writs by CraftingType ID (1-7) or craft name
-                craft_col = WRIT_CRAFT_IDS.get(k) if isinstance(k, int) else None
+                # Use the 'craft' field inside the entry (CraftingType 1-7), NOT the array index k
+                craft_id = w_entry.get("craft")
+                craft_col = WRIT_CRAFT_IDS.get(craft_id) if isinstance(craft_id, int) else None
                 if not craft_col:
                     w_name = str(w_entry.get("name", k))
                     for col_name in w_status:
@@ -2326,7 +2330,12 @@ class AltholicApp:
 
                 if craft_col:
                     last_done = w_entry.get("lastDone", 0)
-                    is_active = w_entry.get("active", False) or w_entry.get("status") == "active"
+                    last_started = w_entry.get("lastStarted", 0)
+                    is_active = (
+                        w_entry.get("active", False)
+                        or w_entry.get("status") == "active"
+                        or (isinstance(last_started, (int, float)) and last_started > last_done)
+                    )
                     if isinstance(last_done, (int, float)) and last_done >= last_reset_ts:
                         w_status[craft_col] = "Done"
                     elif is_active:
